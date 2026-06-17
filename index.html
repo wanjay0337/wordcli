@@ -1,0 +1,286 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Word CLI Web - GitHub Pages</title>
+    <style>
+        /* 還原原本的 VS Code 暗黑終端機風格 */
+        body {
+            background-color: #1e1e1e;
+            color: #d4d4d4;
+            font-family: 'Consolas', 'Courier New', monospace;
+            margin: 0;
+            padding: 20px;
+            display: flex;
+            flex-direction: column;
+            height: 100vh;
+        }
+        #terminal {
+            flex: 1;
+            overflow-y: auto;
+            margin-bottom: 10px;
+            padding: 10px;
+            border: 1px solid #333;
+            border-radius: 5px;
+            background: #1e1e1e;
+            line-height: 1.6;
+        }
+        .input-line {
+            display: flex;
+            align-items: center;
+            background: #252526;
+            padding: 10px;
+            border-radius: 5px;
+            border: 1px solid #3c3c3c;
+        }
+        .prompt {
+            color: #569cd6;
+            margin-right: 10px;
+            font-weight: bold;
+        }
+        #query-input {
+            flex: 1;
+            background: transparent;
+            border: none;
+            color: #d4d4d4;
+            font-family: inherit;
+            font-size: 16px;
+            outline: none;
+        }
+        .output-line { margin-bottom: 8px; }
+        a { color: #00ffff; text-decoration: none; }
+        a:hover { text-decoration: underline; }
+        /* 滾動條美化 */
+        ::-webkit-scrollbar { width: 8px; }
+        ::-webkit-scrollbar-track { background: #1e1e1e; }
+        ::-webkit-scrollbar-thumb { background: #424242; border-radius: 4px; }
+    </style>
+</head>
+<body>
+
+    <div id="terminal">
+        <div class="output-line" style="color: #6a9955;"># 歡迎使用 Word CLI Web (Static Version)</div>
+        <div class="output-line" style="color: #6a9955;"># 輸入英文單字查詢分級、詞義與例句。</div>
+        <div class="output-line" style="color: #6a9955;"># Powered by GitHub Pages & Free Dictionary API.</div>
+        <div id="output-area"></div>
+    </div>
+
+    <div class="input-line">
+        <span class="prompt">query &gt;</span>
+        <input type="text" id="query-input" placeholder="輸入單字 (例如: running, apples, hello)..." autofocus>
+    </div>
+
+    <script>
+        // --- 全域變數 ---
+        let wordDb = {};
+        let wordKeysList = [];
+        const outputArea = document.getElementById('output-area');
+        const input = document.getElementById('query-input');
+
+        // --- 1. 啟動時載入 JSON 資料庫 ---
+        async function loadDatabase() {
+            try {
+                // GitHub Pages 會直接 fetch 同目錄下的 json
+                const response = await fetch('word_db.json');
+                const rawData = await response.json();
+                
+                // 相容 app.py 的兩種 JSON 格式 (List 或 Object)
+                if (Array.isArray(rawData)) {
+                    rawData.forEach(item => {
+                        wordDb[item.word.toLowerCase().strip()] = item.level || 'N/A';
+                    });
+                } else {
+                    for (let k in rawData) {
+                        wordDb[k.toLowerCase().trim()] = rawData[k];
+                    }
+                }
+                wordKeysList = Object.keys(wordDb);
+                appendOutput(`<span style="color: #6a9955;">[*] Database loaded: ${wordKeysList.length} words indexed.</span>`);
+            } catch (e) {
+                appendOutput(`<span style="color: #f44747;">[!] Error loading word_db.json: ${e.message}</span>`);
+            }
+        }
+
+        // --- 2. 單字還原邏輯 (移植自 Python) ---
+        function lemmatizeSimple(word) {
+            if (word.length <= 3) return [];
+            let attempts = [];
+            if (word.endsWith('s')) {
+                attempts.push(word.slice(0, -1));
+                if (word.endsWith('es')) attempts.push(word.slice(0, -2));
+            }
+            if (word.endsWith('ed')) {
+                attempts.push(word.slice(0, -1));
+                attempts.push(word.slice(0, -2));
+            }
+            if (word.endsWith('ing')) {
+                attempts.push(word.slice(0, -3));
+                if (word.length > 5 && word[word.length - 4] === word[word.length - 5]) {
+                    attempts.push(word.slice(0, -4));
+                }
+            }
+            return attempts;
+        }
+
+        // --- 3. 模糊搜尋邏輯 (JS 實作 Levenshtein + 效能優化) ---
+        function levenshtein(a, b) {
+            if (a.length === 0) return b.length;
+            if (b.length === 0) return a.length;
+            const matrix = [];
+            for (let i = 0; i <= b.length; i++) matrix[i] = [i];
+            for (let j = 0; j <= a.length; j++) matrix[0][j] = j;
+            for (let i = 1; i <= b.length; i++) {
+                for (let j = 1; j <= a.length; j++) {
+                    if (b.charAt(i - 1) === a.charAt(j - 1)) {
+                        matrix[i][j] = matrix[i - 1][j - 1];
+                    } else {
+                        matrix[i][j] = Math.min(
+                            matrix[i - 1][j - 1] + 1,
+                            matrix[i][j - 1] + 1,
+                            matrix[i - 1][j] + 1
+                        );
+                    }
+                }
+            }
+            return matrix[b.length][a.length];
+        }
+
+        function getCloseMatches(inputWord, n = 3) {
+            // 效能優化：先過濾出長度相近或包含的字，避免對幾萬個字全跑 Levenshtein
+            let candidates = wordKeysList.filter(w => 
+                Math.abs(w.length - inputWord.length) <= 2 || 
+                w.includes(inputWord) || 
+                inputWord.includes(w)
+            );
+            if (candidates.length === 0) candidates = wordKeysList; 
+
+            // 計算相似度並排序 (cutoff 0.7 對應 Python difflib)
+            let matches = candidates
+                .map(w => ({ word: w, score: 1 - (levenshtein(inputWord, w) / Math.max(inputWord.length, w.length)) }))
+                .filter(item => item.score >= 0.7 && item.word !== inputWord)
+                .sort((a, b) => b.score - a.score)
+                .slice(0, n);
+            
+            return matches.map(m => m.word);
+        }
+
+        // --- 4. 呼叫免費 Dictionary API (取代 NLTK) ---
+        async function getMeaningFromAPI(word) {
+            try {
+                const res = await fetch(`https://api.dictionaryapi.dev/api/v2/entries/en/${word}`);
+                if (!res.ok) return [];
+                const data = await res.json();
+                
+                let results = [];
+                let seenPos = new Set();
+                
+                // 解析 API 回傳格式，模擬原 NLTK 輸出
+                for (let meaning of data[0].meanings) {
+                    let pos = meaning.partOfSpeech;
+                    let posName = { noun: 'Noun', verb: 'Verb', adjective: 'Adj', adverb: 'Adv' }[pos] || pos;
+                    
+                    if (!seenPos.has(posName) && results.length < 2) {
+                        let def = meaning.definitions[0];
+                        let info = `[${posName}] ${def.definition}`;
+                        if (def.example) {
+                            info += `<br><span style='color: #888; font-style: italic; font-size: 0.9em; margin-left: 20px;'>&nbsp;&nbsp;ex: ${def.example}</span>`;
+                        }
+                        results.push(info);
+                        seenPos.add(posName);
+                    }
+                }
+                return results;
+            } catch (e) {
+                return [];
+            }
+        }
+
+        // --- 5. 核心查詢邏輯 ---
+        async function handleQuery() {
+            const userInput = input.value.toLowerCase().trim();
+            if (!userInput) return;
+            
+            input.value = ''; // 清空輸入框
+            appendOutput(`<span style="color: #569cd6;">query &gt; ${userInput}</span>`);
+
+            let output = [];
+            let finalWord = userInput;
+            let level = wordDb[userInput];
+
+            // 邏輯 1: 單字還原
+            if (!level) {
+                for (let alt of lemmatizeSimple(userInput)) {
+                    if (wordDb[alt]) {
+                        level = wordDb[alt];
+                        finalWord = alt;
+                        output.push(`<span style='color:#569cd6'>ℹ️ 識別原形：${userInput} -> ${finalWord}</span>`);
+                        break;
+                    }
+                }
+            }
+
+            // 邏輯 2: 顯示分級
+            if (level) {
+                output.push(`⭐ 單字: <span style='color:#fff; font-weight:bold;'>${finalWord}</span>`);
+                let lvlInt = parseInt(level);
+                let color = "#888888";
+                let lvlText = `第 ${level} 級`;
+                if (!isNaN(lvlInt)) {
+                    if (lvlInt <= 2) { color = "#00ff00"; lvlText += " (初級)"; }
+                    else if (lvlInt <= 4) { color = "#ffff00"; lvlText += " (中級)"; }
+                    else { color = "#ff0000"; lvlText += " (高級)"; }
+                }
+                output.push(`📈 分級: <span style='color:${color}'>${lvlText}</span>`);
+            } else {
+                output.push(`<span style='color:#ff4444'>❌ 找不到 '${userInput}' 的分級資料</span>`);
+            }
+
+            // 邏輯 3: 調用 API 獲取字典解釋
+            let meanings = await getMeaningFromAPI(finalWord);
+            if (meanings.length > 0) {
+                meanings.forEach(m => output.push(`📖 ${m}`));
+            } else {
+                let rawMeanings = await getMeaningFromAPI(userInput);
+                if (rawMeanings.length > 0) {
+                    rawMeanings.forEach(m => output.push(`📖 ${m}`));
+                } else {
+                    output.push(`<span style='color:#666'>   (線上字典查無此單字)</span>`);
+                }
+            }
+
+            // 邏輯 4: 模糊搜尋
+            if (!level) {
+                let suggestions = getCloseMatches(userInput);
+                if (suggestions.length > 0) {
+                    output.push(`🤔 猜你想找: <span style='color:#ffff00'>${suggestions.join(', ')}</span>`);
+                }
+            }
+
+            // 邏輯 5: 外部連結
+            output.push(`🌐 <a href='https://dictionary.cambridge.org/dictionary/english-chinese-traditional/${finalWord}' target='_blank'>[Open Cambridge Dictionary]</a>`);
+            
+            // 渲染結果
+            output.forEach(line => appendOutput(line));
+            appendOutput('<br>'); // 空行
+        }
+
+        // --- UI 輔助函式 ---
+        function appendOutput(html) {
+            const div = document.createElement('div');
+            div.className = 'output-line';
+            div.innerHTML = html;
+            outputArea.appendChild(div);
+            document.getElementById('terminal').scrollTop = document.getElementById('terminal').scrollHeight;
+        }
+
+        // --- 事件監聽 ---
+        input.addEventListener('keypress', (e) => {
+            if (e.key === 'Enter') handleQuery();
+        });
+
+        // 啟動
+        loadDatabase();
+    </script>
+</body>
+</html>
