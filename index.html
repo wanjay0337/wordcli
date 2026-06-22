@@ -81,6 +81,7 @@
         <div class="output-line" style="color: var(--dim);"># 歡迎使用 Word CLI Web (Static Version)</div>
         <div class="output-line" style="color: var(--dim);"># 輸入英文單字查詢分級、詞義與例句。輸入 /help 查看所有指令。</div>
         <div class="output-line" style="color: var(--dim);"># Powered by GitHub Pages & Free Dictionary API.</div>
+        <div class="output-line" style="color: var(--dim);"># Made by wanjay0337 and AI.</div>
         <div id="output-area"></div>
     </div>
 
@@ -477,10 +478,10 @@
             '<span style="color: var(--dim);">/color [主題]</span> — 切換配色，可用: ' + Object.keys(THEMES).join(', '),
             '<span style="color: var(--dim);">/history</span> — 顯示輸入歷史，輸入 !N 重新執行第 N 筆',
             '<span style="color: var(--dim);">/save [單字]</span> — 收藏單字（無參數時收藏最近查詢的單字）',
-            '<span style="color: var(--dim);">/list</span> — 列出收藏清單',
+            '<span style="color: var(--dim);">/list, /ls</span> — 列出收藏清單',
             '<span style="color: var(--dim);">/rm [單字]</span> — 從收藏清單移除',
             '<span style="color: var(--dim);">/share</span> — 把收藏清單編碼成可分享的網址',
-            '<span style="color: var(--dim);">/help</span> — 顯示這個說明'
+            '<span style="color: var(--dim);">/help, /h</span> — 顯示這個說明'
         ];
         lines.forEach(l => appendOutput(l));
     }
@@ -576,10 +577,12 @@
         '/clear': cmdClear,
         '/cls': cmdClear,
         '/help': cmdHelp,
+        '/h': cmdHelp,
         '/color': cmdColor,
         '/history': cmdHistory,
         '/save': cmdSave,
         '/list': cmdList,
+        '/ls': cmdList,
         '/rm': cmdRm,
         '/share': cmdShare
     };
