@@ -5,282 +5,696 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Word CLI Web - GitHub Pages</title>
     <style>
-        /* 還原原本的 VS Code 暗黑終端機風格 */
+        /* ===== 主題色彩透過 CSS 變數控制，預設為 dark ===== */
+        :root {
+            --bg: #1e1e1e;
+            --fg: #d4d4d4;
+            --prompt: #569cd6;
+            --accent: #00ffff;
+            --dim: #6a9955;
+            --error: #f44747;
+            --border: #3c3c3c;
+            --input-bg: #252526;
+        }
+
         body {
-            background-color: #1e1e1e;
-            color: #d4d4d4;
+            background-color: var(--bg);
+            color: var(--fg);
             font-family: 'Consolas', 'Courier New', monospace;
             margin: 0;
             padding: 20px;
             display: flex;
             flex-direction: column;
             height: 100vh;
+            box-sizing: border-box;
+            transition: background-color 0.15s ease, color 0.15s ease;
         }
+
         #terminal {
             flex: 1;
             overflow-y: auto;
             margin-bottom: 10px;
             padding: 10px;
-            border: 1px solid #333;
+            border: 1px solid var(--border);
             border-radius: 5px;
-            background: #1e1e1e;
+            background: var(--bg);
             line-height: 1.6;
         }
+
         .input-line {
             display: flex;
             align-items: center;
-            background: #252526;
+            background: var(--input-bg);
             padding: 10px;
             border-radius: 5px;
-            border: 1px solid #3c3c3c;
+            border: 1px solid var(--border);
         }
+
         .prompt {
-            color: #569cd6;
+            color: var(--prompt);
             margin-right: 10px;
             font-weight: bold;
         }
+
         #query-input {
             flex: 1;
             background: transparent;
             border: none;
-            color: #d4d4d4;
+            color: var(--fg);
             font-family: inherit;
             font-size: 16px;
             outline: none;
         }
-        .output-line { margin-bottom: 8px; }
-        a { color: #00ffff; text-decoration: none; }
+
+        .output-line { margin-bottom: 8px; word-break: break-word; }
+        a { color: var(--accent); text-decoration: none; }
         a:hover { text-decoration: underline; }
-        /* 滾動條美化 */
+
         ::-webkit-scrollbar { width: 8px; }
-        ::-webkit-scrollbar-track { background: #1e1e1e; }
-        ::-webkit-scrollbar-thumb { background: #424242; border-radius: 4px; }
+        ::-webkit-scrollbar-track { background: var(--bg); }
+        ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
     </style>
 </head>
 <body>
 
     <div id="terminal">
-        <div class="output-line" style="color: #6a9955;"># 歡迎使用 Word CLI Web (Static Version)</div>
-        <div class="output-line" style="color: #6a9955;"># 輸入英文單字查詢分級、詞義與例句。</div>
-        <div class="output-line" style="color: #6a9955;"># Powered by GitHub Pages & Free Dictionary API.</div>
+        <div class="output-line" style="color: var(--dim);"># 歡迎使用 Word CLI Web (Static Version)</div>
+        <div class="output-line" style="color: var(--dim);"># 輸入英文單字查詢分級、詞義與例句。輸入 /help 查看所有指令。</div>
+        <div class="output-line" style="color: var(--dim);"># Powered by GitHub Pages & Free Dictionary API.</div>
         <div id="output-area"></div>
     </div>
 
     <div class="input-line">
         <span class="prompt">query &gt;</span>
-        <input type="text" id="query-input" placeholder="輸入單字 (例如: running, apples, hello)..." autofocus>
+        <input type="text" id="query-input" placeholder="輸入單字或指令 (例如: apple, /help)..." autofocus>
     </div>
 
     <script>
-        // --- 全域變數 ---
-        let wordDb = {};
-        let wordKeysList = [];
-        const outputArea = document.getElementById('output-area');
-        const input = document.getElementById('query-input');
+    /* ============================================================
+     *  狀態 (State)
+     * ============================================================ */
+    let wordDb = {};            // { word: level }
+    let wordKeysList = [];       // 依 JSON 原始順序排列，index 即為分享編碼用的索引
+    let wordIndexMap = new Map(); // word -> index，方便 O(1) 查找
+    let favorites = {};          // { word: true }  收藏清單
+    let freq = {};               // { word: count } 查詢次數統計
+    let inputHistory = [];       // 所有輸入過的行（單字查詢或指令）
+    let historyPointer = 0;      // 上下鍵游標位置
+    let lastQueriedWord = '';    // 最近一次查詢的單字，供 /save 無參數時使用
+    let currentTheme = 'dark';
 
-        // --- 1. 啟動時載入 JSON 資料庫 ---
-        async function loadDatabase() {
-            try {
-                // GitHub Pages 會直接 fetch 同目錄下的 json
-                const response = await fetch('word_db.json');
-                const rawData = await response.json();
-                
-                // 相容 app.py 的兩種 JSON 格式 (List 或 Object)
-                if (Array.isArray(rawData)) {
-                    rawData.forEach(item => {
-                        wordDb[item.word.toLowerCase().strip()] = item.level || 'N/A';
-                    });
-                } else {
-                    for (let k in rawData) {
-                        wordDb[k.toLowerCase().trim()] = rawData[k];
-                    }
-                }
-                wordKeysList = Object.keys(wordDb);
-                appendOutput(`<span style="color: #6a9955;">[*] Database loaded: ${wordKeysList.length} words indexed.</span>`);
-            } catch (e) {
-                appendOutput(`<span style="color: #f44747;">[!] Error loading word_db.json: ${e.message}</span>`);
-            }
+    const outputArea = document.getElementById('output-area');
+    const input = document.getElementById('query-input');
+
+    /* ============================================================
+     *  本地儲存 (Storage) - 全部包 try/catch，避免私密模式炸掉
+     * ============================================================ */
+    const STORAGE_KEYS = {
+        favorites: 'wordcli_favorites',
+        freq: 'wordcli_freq',
+        history: 'wordcli_history',
+        theme: 'wordcli_theme'
+    };
+
+    function safeGet(key, fallback) {
+        try {
+            const raw = localStorage.getItem(key);
+            return raw ? JSON.parse(raw) : fallback;
+        } catch (e) {
+            return fallback;
         }
+    }
 
-        // --- 2. 單字還原邏輯 (移植自 Python) ---
-        function lemmatizeSimple(word) {
-            if (word.length <= 3) return [];
-            let attempts = [];
-            if (word.endsWith('s')) {
-                attempts.push(word.slice(0, -1));
-                if (word.endsWith('es')) attempts.push(word.slice(0, -2));
-            }
-            if (word.endsWith('ed')) {
-                attempts.push(word.slice(0, -1));
-                attempts.push(word.slice(0, -2));
-            }
-            if (word.endsWith('ing')) {
-                attempts.push(word.slice(0, -3));
-                if (word.length > 5 && word[word.length - 4] === word[word.length - 5]) {
-                    attempts.push(word.slice(0, -4));
-                }
-            }
-            return attempts;
-        }
+    function safeSet(key, value) {
+        try {
+            localStorage.setItem(key, JSON.stringify(value));
+        } catch (e) { /* 私密模式或容量爆了，忽略即可 */ }
+    }
 
-        // --- 3. 模糊搜尋邏輯 (JS 實作 Levenshtein + 效能優化) ---
-        function levenshtein(a, b) {
-            if (a.length === 0) return b.length;
-            if (b.length === 0) return a.length;
-            const matrix = [];
-            for (let i = 0; i <= b.length; i++) matrix[i] = [i];
-            for (let j = 0; j <= a.length; j++) matrix[0][j] = j;
-            for (let i = 1; i <= b.length; i++) {
-                for (let j = 1; j <= a.length; j++) {
-                    if (b.charAt(i - 1) === a.charAt(j - 1)) {
-                        matrix[i][j] = matrix[i - 1][j - 1];
-                    } else {
-                        matrix[i][j] = Math.min(
-                            matrix[i - 1][j - 1] + 1,
-                            matrix[i][j - 1] + 1,
-                            matrix[i - 1][j] + 1
-                        );
-                    }
-                }
-            }
-            return matrix[b.length][a.length];
-        }
+    function loadLocalState() {
+        favorites = safeGet(STORAGE_KEYS.favorites, {});
+        freq = safeGet(STORAGE_KEYS.freq, {});
+        inputHistory = safeGet(STORAGE_KEYS.history, []);
+        currentTheme = safeGet(STORAGE_KEYS.theme, 'dark');
+        historyPointer = inputHistory.length;
+    }
 
-        function getCloseMatches(inputWord, n = 3) {
-            // 效能優化：先過濾出長度相近或包含的字，避免對幾萬個字全跑 Levenshtein
-            let candidates = wordKeysList.filter(w => 
-                Math.abs(w.length - inputWord.length) <= 2 || 
-                w.includes(inputWord) || 
-                inputWord.includes(w)
-            );
-            if (candidates.length === 0) candidates = wordKeysList; 
+    function saveFavorites() { safeSet(STORAGE_KEYS.favorites, favorites); }
+    function saveFreq() { safeSet(STORAGE_KEYS.freq, freq); }
+    function saveHistory() { safeSet(STORAGE_KEYS.history, inputHistory.slice(-200)); }
 
-            // 計算相似度並排序 (cutoff 0.7 對應 Python difflib)
-            let matches = candidates
-                .map(w => ({ word: w, score: 1 - (levenshtein(inputWord, w) / Math.max(inputWord.length, w.length)) }))
-                .filter(item => item.score >= 0.7 && item.word !== inputWord)
-                .sort((a, b) => b.score - a.score)
-                .slice(0, n);
-            
-            return matches.map(m => m.word);
-        }
+    function pushHistory(line) {
+        inputHistory.push(line);
+        if (inputHistory.length > 200) inputHistory = inputHistory.slice(-200);
+        historyPointer = inputHistory.length;
+        saveHistory();
+    }
 
-        // --- 4. 呼叫免費 Dictionary API (取代 NLTK) ---
-        async function getMeaningFromAPI(word) {
-            try {
-                const res = await fetch(`https://api.dictionaryapi.dev/api/v2/entries/en/${word}`);
-                if (!res.ok) return [];
-                const data = await res.json();
-                
-                let results = [];
-                let seenPos = new Set();
-                
-                // 解析 API 回傳格式，模擬原 NLTK 輸出
-                for (let meaning of data[0].meanings) {
-                    let pos = meaning.partOfSpeech;
-                    let posName = { noun: 'Noun', verb: 'Verb', adjective: 'Adj', adverb: 'Adv' }[pos] || pos;
-                    
-                    if (!seenPos.has(posName) && results.length < 2) {
-                        let def = meaning.definitions[0];
-                        let info = `[${posName}] ${def.definition}`;
-                        if (def.example) {
-                            info += `<br><span style='color: #888; font-style: italic; font-size: 0.9em; margin-left: 20px;'>&nbsp;&nbsp;ex: ${def.example}</span>`;
-                        }
-                        results.push(info);
-                        seenPos.add(posName);
-                    }
-                }
-                return results;
-            } catch (e) {
-                return [];
-            }
-        }
+    /* ============================================================
+     *  資料庫載入
+     * ============================================================ */
+    async function loadDatabase() {
+        try {
+            const response = await fetch('word_db.json');
+            const rawData = await response.json();
 
-        // --- 5. 核心查詢邏輯 ---
-        async function handleQuery() {
-            const userInput = input.value.toLowerCase().trim();
-            if (!userInput) return;
-            
-            input.value = ''; // 清空輸入框
-            appendOutput(`<span style="color: #569cd6;">query &gt; ${userInput}</span>`);
-
-            let output = [];
-            let finalWord = userInput;
-            let level = wordDb[userInput];
-
-            // 邏輯 1: 單字還原
-            if (!level) {
-                for (let alt of lemmatizeSimple(userInput)) {
-                    if (wordDb[alt]) {
-                        level = wordDb[alt];
-                        finalWord = alt;
-                        output.push(`<span style='color:#569cd6'>ℹ️ 識別原形：${userInput} -> ${finalWord}</span>`);
-                        break;
-                    }
-                }
-            }
-
-            // 邏輯 2: 顯示分級
-            if (level) {
-                output.push(`⭐ 單字: <span style='color:#fff; font-weight:bold;'>${finalWord}</span>`);
-                let lvlInt = parseInt(level);
-                let color = "#888888";
-                let lvlText = `第 ${level} 級`;
-                if (!isNaN(lvlInt)) {
-                    if (lvlInt <= 2) { color = "#00ff00"; lvlText += " (初級)"; }
-                    else if (lvlInt <= 4) { color = "#ffff00"; lvlText += " (中級)"; }
-                    else { color = "#ff0000"; lvlText += " (高級)"; }
-                }
-                output.push(`📈 分級: <span style='color:${color}'>${lvlText}</span>`);
+            // 相容舊版可能的陣列格式（修正原本 .strip() 不是 JS 方法的 bug）
+            if (Array.isArray(rawData)) {
+                rawData.forEach(item => {
+                    wordDb[item.word.toLowerCase().trim()] = item.level || 'N/A';
+                });
             } else {
-                output.push(`<span style='color:#ff4444'>❌ 找不到 '${userInput}' 的分級資料</span>`);
+                // 維持 JSON 檔案原始 key 順序（決定了分享連結的編碼索引）
+                for (const k in rawData) {
+                    wordDb[k.toLowerCase().trim()] = rawData[k];
+                }
             }
 
-            // 邏輯 3: 調用 API 獲取字典解釋
-            let meanings = await getMeaningFromAPI(finalWord);
-            if (meanings.length > 0) {
-                meanings.forEach(m => output.push(`📖 ${m}`));
-            } else {
-                let rawMeanings = await getMeaningFromAPI(userInput);
-                if (rawMeanings.length > 0) {
-                    rawMeanings.forEach(m => output.push(`📖 ${m}`));
+            wordKeysList = Object.keys(wordDb);
+            wordIndexMap = new Map(wordKeysList.map((w, i) => [w, i]));
+
+            appendOutput(`<span style="color: var(--dim);">[*] Database loaded: ${wordKeysList.length} words indexed.</span>`);
+        } catch (e) {
+            appendOutput(`<span style="color: var(--error);">[!] Error loading word_db.json: ${escapeHtml(e.message)}</span>`);
+        }
+    }
+
+    /* ============================================================
+     *  單字還原 (lemmatize) - 與原版邏輯相同
+     * ============================================================ */
+    function lemmatizeSimple(word) {
+        if (word.length <= 3) return [];
+        let attempts = [];
+        if (word.endsWith('s')) {
+            attempts.push(word.slice(0, -1));
+            if (word.endsWith('es')) attempts.push(word.slice(0, -2));
+        }
+        if (word.endsWith('ed')) {
+            attempts.push(word.slice(0, -1));
+            attempts.push(word.slice(0, -2));
+        }
+        if (word.endsWith('ing')) {
+            attempts.push(word.slice(0, -3));
+            if (word.length > 5 && word[word.length - 4] === word[word.length - 5]) {
+                attempts.push(word.slice(0, -4));
+            }
+        }
+        return attempts;
+    }
+
+    /* ============================================================
+     *  模糊搜尋 (Levenshtein) - 與原版邏輯相同
+     * ============================================================ */
+    function levenshtein(a, b) {
+        if (a.length === 0) return b.length;
+        if (b.length === 0) return a.length;
+        const matrix = [];
+        for (let i = 0; i <= b.length; i++) matrix[i] = [i];
+        for (let j = 0; j <= a.length; j++) matrix[0][j] = j;
+        for (let i = 1; i <= b.length; i++) {
+            for (let j = 1; j <= a.length; j++) {
+                if (b.charAt(i - 1) === a.charAt(j - 1)) {
+                    matrix[i][j] = matrix[i - 1][j - 1];
                 } else {
-                    output.push(`<span style='color:#666'>   (線上字典查無此單字)</span>`);
+                    matrix[i][j] = Math.min(
+                        matrix[i - 1][j - 1] + 1,
+                        matrix[i][j - 1] + 1,
+                        matrix[i - 1][j] + 1
+                    );
                 }
             }
+        }
+        return matrix[b.length][a.length];
+    }
 
-            // 邏輯 4: 模糊搜尋
-            if (!level) {
-                let suggestions = getCloseMatches(userInput);
-                if (suggestions.length > 0) {
-                    output.push(`🤔 猜你想找: <span style='color:#ffff00'>${suggestions.join(', ')}</span>`);
+    function getCloseMatches(inputWord, n = 3) {
+        let candidates = wordKeysList.filter(w =>
+            Math.abs(w.length - inputWord.length) <= 2 ||
+            w.includes(inputWord) ||
+            inputWord.includes(w)
+        );
+        if (candidates.length === 0) candidates = wordKeysList;
+
+        let matches = candidates
+            .map(w => ({ word: w, score: 1 - (levenshtein(inputWord, w) / Math.max(inputWord.length, w.length)) }))
+            .filter(item => item.score >= 0.7 && item.word !== inputWord)
+            .sort((a, b) => b.score - a.score)
+            .slice(0, n);
+
+        return matches.map(m => m.word);
+    }
+
+    /* ============================================================
+     *  字典 API
+     * ============================================================ */
+    async function getMeaningFromAPI(word) {
+        try {
+            const res = await fetch(`https://api.dictionaryapi.dev/api/v2/entries/en/${encodeURIComponent(word)}`);
+            if (!res.ok) return [];
+            const data = await res.json();
+
+            let results = [];
+            let seenPos = new Set();
+
+            for (let meaning of data[0].meanings) {
+                let pos = meaning.partOfSpeech;
+                let posName = { noun: 'Noun', verb: 'Verb', adjective: 'Adj', adverb: 'Adv' }[pos] || pos;
+
+                if (!seenPos.has(posName) && results.length < 2) {
+                    let def = meaning.definitions[0];
+                    let info = `[${posName}] ${def.definition}`;
+                    if (def.example) {
+                        info += `<br><span style='color: var(--dim); font-style: italic; font-size: 0.9em; margin-left: 20px;'>&nbsp;&nbsp;ex: ${def.example}</span>`;
+                    }
+                    results.push(info);
+                    seenPos.add(posName);
                 }
             }
+            return results;
+        } catch (e) {
+            return [];
+        }
+    }
 
-            // 邏輯 5: 外部連結
-            output.push(`🌐 <a href='https://dictionary.cambridge.org/dictionary/english-chinese-traditional/${finalWord}' target='_blank'>[Open Cambridge Dictionary]</a>`);
-            
-            // 渲染結果
-            output.forEach(line => appendOutput(line));
-            appendOutput('<br>'); // 空行
+    /* ============================================================
+     *  單字查詢主邏輯 (與原版功能相同，只是抽成獨立函式)
+     * ============================================================ */
+    async function queryWord(rawInput) {
+        const userInput = rawInput.toLowerCase().trim();
+        if (!userInput) return;
+
+        let output = [];
+        let finalWord = userInput;
+        let level = wordDb[userInput];
+
+        // 邏輯 1: 單字還原
+        if (!level) {
+            for (let alt of lemmatizeSimple(userInput)) {
+                if (wordDb[alt]) {
+                    level = wordDb[alt];
+                    finalWord = alt;
+                    output.push(`<span style='color:var(--prompt)'>ℹ️ 識別原形：${escapeHtml(userInput)} -> ${escapeHtml(finalWord)}</span>`);
+                    break;
+                }
+            }
         }
 
-        // --- UI 輔助函式 ---
-        function appendOutput(html) {
-            const div = document.createElement('div');
-            div.className = 'output-line';
-            div.innerHTML = html;
-            outputArea.appendChild(div);
-            document.getElementById('terminal').scrollTop = document.getElementById('terminal').scrollHeight;
+        // 邏輯 2: 顯示分級（分級顏色為固定語意色，不隨主題變化）
+        if (level) {
+            output.push(`⭐ 單字: <span style='color:#fff; font-weight:bold;'>${escapeHtml(finalWord)}</span>`);
+            let lvlInt = parseInt(level);
+            let color = "#888888";
+            let lvlText = `第 ${level} 級`;
+            if (!isNaN(lvlInt)) {
+                if (lvlInt <= 2) { color = "#00ff00"; lvlText += " (初級)"; }
+                else if (lvlInt <= 4) { color = "#ffff00"; lvlText += " (中級)"; }
+                else { color = "#ff0000"; lvlText += " (高級)"; }
+            }
+            output.push(`📈 分級: <span style='color:${color}'>${lvlText}</span>`);
+        } else {
+            output.push(`<span style='color:var(--error)'>❌ 找不到 '${escapeHtml(userInput)}' 的分級資料</span>`);
         }
 
-        // --- 事件監聽 ---
-        input.addEventListener('keypress', (e) => {
-            if (e.key === 'Enter') handleQuery();
+        // 邏輯 3: 字典解釋
+        let meanings = await getMeaningFromAPI(finalWord);
+        if (meanings.length > 0) {
+            meanings.forEach(m => output.push(`📖 ${m}`));
+        } else {
+            let rawMeanings = await getMeaningFromAPI(userInput);
+            if (rawMeanings.length > 0) {
+                rawMeanings.forEach(m => output.push(`📖 ${m}`));
+            } else {
+                output.push(`<span style='color:var(--dim)'>   (線上字典查無此單字)</span>`);
+            }
+        }
+
+        // 邏輯 4: 模糊搜尋
+        if (!level) {
+            let suggestions = getCloseMatches(userInput);
+            if (suggestions.length > 0) {
+                output.push(`🤔 猜你想找: <span style='color:#ffff00'>${suggestions.map(escapeHtml).join(', ')}</span>`);
+            }
+        }
+
+        // 邏輯 5: 外部連結
+        output.push(`🌐 <a href='https://dictionary.cambridge.org/dictionary/english-chinese-traditional/${encodeURIComponent(finalWord)}' target='_blank'>[Open Cambridge Dictionary]</a>`);
+
+        output.forEach(line => appendOutput(line));
+
+        // 記錄查詢次數 + 最近查詢單字（供 /save 使用）
+        lastQueriedWord = finalWord;
+        freq[finalWord] = (freq[finalWord] || 0) + 1;
+        saveFreq();
+    }
+
+    /* ============================================================
+     *  62 進位編碼 / 解碼 (網址分享用)
+     * ============================================================ */
+    const BASE62 = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz';
+    const CODE_LEN = 3; // 62^3 = 238,328，遠超過目前 6,092 個單字
+
+    function base62Encode(num) {
+        let s = '';
+        let n = num;
+        do {
+            s = BASE62[n % 62] + s;
+            n = Math.floor(n / 62);
+        } while (n > 0);
+        while (s.length < CODE_LEN) s = BASE62[0] + s;
+        return s;
+    }
+
+    function base62Decode(str) {
+        let n = 0;
+        for (const ch of str) {
+            const v = BASE62.indexOf(ch);
+            if (v === -1) throw new Error('invalid base62 char');
+            n = n * 62 + v;
+        }
+        return n;
+    }
+
+    function wordToHex(word) {
+        let hex = '';
+        for (let i = 0; i < word.length; i++) {
+            hex += word.charCodeAt(i).toString(16).padStart(2, '0');
+        }
+        return hex;
+    }
+
+    function hexToWord(hex) {
+        let word = '';
+        for (let i = 0; i < hex.length; i += 2) {
+            word += String.fromCharCode(parseInt(hex.substr(i, 2), 16));
+        }
+        return word;
+    }
+
+    // 表內單字 -> 3字元 base62；表外單字 -> _hex_ (用底線包住，底線不會出現在正常 3 字元組合裡，因此可安全混合解析)
+    function encodeWordList(words) {
+        return words.map(w => {
+            const idx = wordIndexMap.get(w);
+            if (idx === undefined) {
+                return `_${wordToHex(w)}_`;
+            }
+            return base62Encode(idx);
+        }).join('');
+    }
+
+    function decodeWordList(code) {
+        const words = [];
+        let i = 0;
+        while (i < code.length) {
+            if (code[i] === '_') {
+                const end = code.indexOf('_', i + 1);
+                if (end === -1) throw new Error('malformed fallback segment');
+                const hex = code.slice(i + 1, end);
+                words.push(hexToWord(hex));
+                i = end + 1;
+            } else {
+                const chunk = code.slice(i, i + CODE_LEN);
+                if (chunk.length < CODE_LEN) throw new Error('malformed index segment');
+                const idx = base62Decode(chunk);
+                const w = wordKeysList[idx];
+                if (w) words.push(w);
+                i += CODE_LEN;
+            }
+        }
+        return words;
+    }
+
+    function importFromURL() {
+        const params = new URLSearchParams(location.search);
+        const code = params.get('w');
+        if (!code) return;
+        try {
+            const words = decodeWordList(code);
+            let added = 0;
+            words.forEach(w => {
+                if (w && !favorites[w]) { favorites[w] = true; added++; }
+            });
+            saveFavorites();
+            if (words.length > 0) {
+                appendOutput(`<span style="color: var(--accent);">📥 已從分享連結匯入 ${words.length} 個單字（新增 ${added} 個）: ${words.map(escapeHtml).join(', ')}</span>`);
+            }
+        } catch (e) {
+            appendOutput(`<span style="color: var(--error);">❌ 分享連結解析失敗 (${escapeHtml(e.message)})</span>`);
+        }
+    }
+
+    /* ============================================================
+     *  主題系統
+     * ============================================================ */
+    const THEMES = {
+        dark:   { bg: '#1e1e1e', fg: '#d4d4d4', prompt: '#569cd6', accent: '#00ffff', dim: '#6a9955', error: '#f44747', border: '#3c3c3c', 'input-bg': '#252526' },
+        hacker: { bg: '#000000', fg: '#00ff66', prompt: '#00ff66', accent: '#33ffaa', dim: '#009944', error: '#ff3344', border: '#003311', 'input-bg': '#001a00' },
+        ubuntu: { bg: '#2c0030', fg: '#ffffff', prompt: '#9fdb4d', accent: '#e95420', dim: '#c9a3d1', error: '#ff7a6e', border: '#5e2750', 'input-bg': '#3d0a44' },
+        light:  { bg: '#ffffff', fg: '#1e1e1e', prompt: '#0050b3', accent: '#b34700', dim: '#707070', error: '#cc0000', border: '#cccccc', 'input-bg': '#f3f3f3' }
+    };
+
+    function applyTheme(name) {
+        const theme = THEMES[name];
+        if (!theme) return;
+        const root = document.documentElement;
+        Object.entries(theme).forEach(([key, value]) => {
+            root.style.setProperty(`--${key}`, value);
         });
+        currentTheme = name;
+        safeSet(STORAGE_KEYS.theme, name);
+    }
 
-        // 啟動
-        loadDatabase();
+    /* ============================================================
+     *  指令系統 (Slash Commands)
+     * ============================================================ */
+    function cmdClear() {
+        outputArea.innerHTML = '';
+    }
+
+    function cmdHelp() {
+        const lines = [
+            '<b style="color: var(--accent);">📜 可用指令</b>',
+            '<span style="color: var(--dim);">/clear, /cls</span> — 清空畫面',
+            '<span style="color: var(--dim);">/color [主題]</span> — 切換配色，可用: ' + Object.keys(THEMES).join(', '),
+            '<span style="color: var(--dim);">/history</span> — 顯示輸入歷史，輸入 !N 重新執行第 N 筆',
+            '<span style="color: var(--dim);">/save [單字]</span> — 收藏單字（無參數時收藏最近查詢的單字）',
+            '<span style="color: var(--dim);">/list</span> — 列出收藏清單',
+            '<span style="color: var(--dim);">/rm [單字]</span> — 從收藏清單移除',
+            '<span style="color: var(--dim);">/share</span> — 把收藏清單編碼成可分享的網址',
+            '<span style="color: var(--dim);">/help</span> — 顯示這個說明'
+        ];
+        lines.forEach(l => appendOutput(l));
+    }
+
+    function cmdColor(arg) {
+        const name = (arg || '').toLowerCase().trim();
+        if (!name) {
+            appendOutput(`目前主題: <span style="color: var(--accent);">${currentTheme}</span>　可用: ${Object.keys(THEMES).join(', ')}`);
+            return;
+        }
+        if (!THEMES[name]) {
+            appendOutput(`<span style="color: var(--error);">❌ 沒有「${escapeHtml(name)}」這個主題，可用: ${Object.keys(THEMES).join(', ')}</span>`);
+            return;
+        }
+        applyTheme(name);
+        appendOutput(`<span style="color: var(--accent);">✅ 已切換主題: ${name}</span>`);
+    }
+
+    function cmdHistory() {
+        if (inputHistory.length === 0) {
+            appendOutput('<span style="color: var(--dim);">（尚無歷史紀錄）</span>');
+            return;
+        }
+        inputHistory.forEach((line, i) => {
+            appendOutput(`<span style="color: var(--dim);">${i + 1}.</span> ${escapeHtml(line)}`);
+        });
+        appendOutput(`<span style="color: var(--dim);">輸入 !N 可重新執行第 N 筆</span>`);
+    }
+
+    function cmdSave(arg) {
+        const word = (arg || lastQueriedWord || '').toLowerCase().trim();
+        if (!word) {
+            appendOutput(`<span style="color: var(--error);">❌ 用法: /save [單字]，或先查詢一個單字再用 /save</span>`);
+            return;
+        }
+        const isNew = !favorites[word];
+        favorites[word] = true;
+        saveFavorites();
+        appendOutput(isNew
+            ? `<span style="color: var(--accent);">⭐ 已收藏: ${escapeHtml(word)}</span>`
+            : `<span style="color: var(--dim);">（${escapeHtml(word)} 已經在收藏清單裡了）</span>`);
+    }
+
+    function cmdList() {
+        const words = Object.keys(favorites);
+        if (words.length === 0) {
+            appendOutput('<span style="color: var(--dim);">（收藏清單是空的，用 /save [單字] 開始收藏）</span>');
+            return;
+        }
+        words.forEach((w, i) => {
+            const cnt = freq[w] || 0;
+            const lvl = wordDb[w] ? `Lv.${wordDb[w]}` : '—';
+            appendOutput(`<span style="color: var(--dim);">${i + 1}.</span> <b>${escapeHtml(w)}</b>　${lvl}　查詢 ${cnt} 次`);
+        });
+    }
+
+    function cmdRm(arg) {
+        const word = (arg || '').toLowerCase().trim();
+        if (!word) {
+            appendOutput(`<span style="color: var(--error);">❌ 用法: /rm [單字]</span>`);
+            return;
+        }
+        if (favorites[word]) {
+            delete favorites[word];
+            saveFavorites();
+            appendOutput(`🗑️ 已移除: ${escapeHtml(word)}`);
+        } else {
+            appendOutput(`<span style="color: var(--error);">❌ 收藏清單裡沒有「${escapeHtml(word)}」</span>`);
+        }
+    }
+
+    function cmdShare() {
+        const words = Object.keys(favorites);
+        if (words.length === 0) {
+            appendOutput('<span style="color: var(--error);">❌ 收藏清單是空的，先用 /save 收藏幾個單字吧</span>');
+            return;
+        }
+        const code = encodeWordList(words);
+        const url = `${location.origin}${location.pathname}?w=${code}`;
+        appendOutput(`🔗 分享連結 (${words.length} 個單字):`);
+        appendOutput(`<a href="${url}" target="_blank">${url}</a>`);
+
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+            navigator.clipboard.writeText(url).then(() => {
+                appendOutput(`<span style="color: var(--accent);">✅ 已複製到剪貼簿</span>`);
+            }).catch(() => {
+                appendOutput(`<span style="color: var(--dim);">（無法自動複製，請手動複製上面的網址）</span>`);
+            });
+        }
+    }
+
+    const COMMANDS = {
+        '/clear': cmdClear,
+        '/cls': cmdClear,
+        '/help': cmdHelp,
+        '/color': cmdColor,
+        '/history': cmdHistory,
+        '/save': cmdSave,
+        '/list': cmdList,
+        '/rm': cmdRm,
+        '/share': cmdShare
+    };
+
+    function executeCommand(raw) {
+        const parts = raw.trim().split(/\s+/);
+        const cmd = parts[0].toLowerCase();
+        const arg = parts.slice(1).join(' ');
+        const handler = COMMANDS[cmd];
+        if (handler) {
+            handler(arg);
+        } else {
+            appendOutput(`<span style="color: var(--error);">❌ 未知指令: ${escapeHtml(cmd)}，輸入 /help 查看可用指令</span>`);
+        }
+    }
+
+    /* ============================================================
+     *  UI 輔助函式
+     * ============================================================ */
+    function escapeHtml(str) {
+        return String(str)
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;');
+    }
+
+    function appendOutput(html) {
+        const div = document.createElement('div');
+        div.className = 'output-line';
+        div.innerHTML = html;
+        outputArea.appendChild(div);
+        document.getElementById('terminal').scrollTop = document.getElementById('terminal').scrollHeight;
+    }
+
+    /* ============================================================
+     *  核心輸入處理
+     * ============================================================ */
+    async function dispatch(raw) {
+        if (raw.startsWith('/')) {
+            executeCommand(raw);
+        } else {
+            await queryWord(raw);
+        }
+    }
+
+    async function handleQuery() {
+        const raw = input.value.trim();
+        if (!raw) return;
+        input.value = '';
+
+        pushHistory(raw);
+
+        const lower = raw.toLowerCase();
+
+        // /clear 或 /cls 直接清空畫面，不留下回顯訊息
+        if (lower === '/clear' || lower === '/cls') {
+            outputArea.innerHTML = '';
+            return;
+        }
+
+        appendOutput(`<span style="color: var(--prompt);">query &gt; ${escapeHtml(raw)}</span>`);
+
+        // !N 重新執行歷史紀錄第 N 筆
+        if (/^!\d+$/.test(raw)) {
+            const idx = parseInt(raw.slice(1), 10) - 1;
+            const recalled = inputHistory[idx];
+            if (recalled !== undefined && idx !== inputHistory.length - 1) {
+                appendOutput(`<span style="color: var(--dim);">↻ ${escapeHtml(recalled)}</span>`);
+                await dispatch(recalled);
+            } else {
+                appendOutput(`<span style="color: var(--error);">❌ 找不到歷史紀錄 #${idx + 1}</span>`);
+            }
+            appendOutput('<br>');
+            return;
+        }
+
+        await dispatch(raw);
+        appendOutput('<br>');
+    }
+
+    /* ============================================================
+     *  事件監聽
+     * ============================================================ */
+    input.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') {
+            handleQuery();
+        } else if (e.key === 'ArrowUp') {
+            if (historyPointer > 0) {
+                historyPointer--;
+                input.value = inputHistory[historyPointer] || '';
+            }
+            e.preventDefault();
+        } else if (e.key === 'ArrowDown') {
+            if (historyPointer < inputHistory.length - 1) {
+                historyPointer++;
+                input.value = inputHistory[historyPointer] || '';
+            } else {
+                historyPointer = inputHistory.length;
+                input.value = '';
+            }
+            e.preventDefault();
+        }
+    });
+
+    /* ============================================================
+     *  啟動流程
+     * ============================================================ */
+    async function init() {
+        loadLocalState();
+        applyTheme(currentTheme);
+        await loadDatabase();
+        importFromURL();
+    }
+
+    init();
     </script>
 </body>
 </html>
