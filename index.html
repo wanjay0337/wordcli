@@ -80,7 +80,7 @@
     <div id="terminal">
         <div class="output-line" style="color: var(--dim);"># 歡迎使用 Word CLI Web (Static Version)</div>
         <div class="output-line" style="color: var(--dim);"># 輸入英文單字查詢分級、詞義與例句。輸入 /help 查看所有指令。</div>
-        <div class="output-line" style="color: var(--dim);"># Powered by GitHub Pages & Free Dictionary API.</div>
+        <div class="output-line" style="color: var(--dim);"># Powered by GitHub Pages, Free Dictionary API & MyMemory Translation.</div>
         <div class="output-line" style="color: var(--dim);"># Made by wanjay0337 and AI.</div>
         <div id="output-area"></div>
     </div>
@@ -103,6 +103,7 @@
     let historyPointer = 0;      // 上下鍵游標位置
     let lastQueriedWord = '';    // 最近一次查詢的單字，供 /save 無參數時使用
     let currentTheme = 'dark';
+    let apiSettings = { defCount: 2, showZh: false }; // 字典精細度設定
 
     const outputArea = document.getElementById('output-area');
     const input = document.getElementById('query-input');
@@ -114,7 +115,8 @@
         favorites: 'wordcli_favorites',
         freq: 'wordcli_freq',
         history: 'wordcli_history',
-        theme: 'wordcli_theme'
+        theme: 'wordcli_theme',
+        apiSettings: 'wordcli_api_settings'
     };
 
     function safeGet(key, fallback) {
@@ -138,11 +140,18 @@
         inputHistory = safeGet(STORAGE_KEYS.history, []);
         currentTheme = safeGet(STORAGE_KEYS.theme, 'dark');
         historyPointer = inputHistory.length;
+
+        // 字典設定 - 防呆：就算 localStorage 裡的值是壞的，也要還原成合理預設值
+        const savedSettings = safeGet(STORAGE_KEYS.apiSettings, null);
+        apiSettings = (savedSettings && typeof savedSettings === 'object') ? savedSettings : { defCount: 2, showZh: false };
+        apiSettings.defCount = Math.min(5, Math.max(1, parseInt(apiSettings.defCount, 10) || 2));
+        apiSettings.showZh = !!apiSettings.showZh;
     }
 
     function saveFavorites() { safeSet(STORAGE_KEYS.favorites, favorites); }
     function saveFreq() { safeSet(STORAGE_KEYS.freq, freq); }
     function saveHistory() { safeSet(STORAGE_KEYS.history, inputHistory.slice(-200)); }
+    function saveApiSettings() { safeSet(STORAGE_KEYS.apiSettings, apiSettings); }
 
     function pushHistory(line) {
         inputHistory.push(line);
@@ -246,39 +255,89 @@
     }
 
     /* ============================================================
-     *  字典 API
+     *  字典 / 翻譯 API 共用：逾時保護
+     *  fetch 沒有原生 timeout，API 卡住會讓畫面看起來像當掉，
+     *  所以統一包一層 timeout，逾時就視為失敗，不會卡住 UI。
      * ============================================================ */
-    async function getMeaningFromAPI(word) {
+    function fetchWithTimeout(url, ms = 6000) {
+        return Promise.race([
+            fetch(url),
+            new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), ms))
+        ]);
+    }
+
+    /* ============================================================
+     *  字典 API (Free Dictionary API)
+     *  回傳格式: [{ posName, definition, example }, ...]，最多 defCount 條
+     *  任何失敗都回傳空陣列，由呼叫端決定要顯示什麼提示文字
+     * ============================================================ */
+    const POS_MAP = { noun: 'Noun', verb: 'Verb', adjective: 'Adj', adverb: 'Adv' };
+
+    async function getMeaningFromAPI(word, defCount) {
         try {
-            const res = await fetch(`https://api.dictionaryapi.dev/api/v2/entries/en/${encodeURIComponent(word)}`);
+            const res = await fetchWithTimeout(`https://api.dictionaryapi.dev/api/v2/entries/en/${encodeURIComponent(word)}`, 6000);
             if (!res.ok) return [];
             const data = await res.json();
 
-            let results = [];
-            let seenPos = new Set();
-
+            let entries = [];
             for (let meaning of data[0].meanings) {
-                let pos = meaning.partOfSpeech;
-                let posName = { noun: 'Noun', verb: 'Verb', adjective: 'Adj', adverb: 'Adv' }[pos] || pos;
-
-                if (!seenPos.has(posName) && results.length < 2) {
-                    let def = meaning.definitions[0];
-                    let info = `[${posName}] ${def.definition}`;
-                    if (def.example) {
-                        info += `<br><span style='color: var(--dim); font-style: italic; font-size: 0.9em; margin-left: 20px;'>&nbsp;&nbsp;ex: ${def.example}</span>`;
-                    }
-                    results.push(info);
-                    seenPos.add(posName);
-                }
+                let posName = POS_MAP[meaning.partOfSpeech] || meaning.partOfSpeech;
+                meaning.definitions.forEach(def => {
+                    entries.push({ posName, definition: def.definition, example: def.example });
+                });
             }
-            return results;
+
+            // 優先讓不同詞性各出現一次，若 defCount 還沒填滿才補同詞性的其他定義
+            let seenPos = new Set();
+            let primary = [];
+            let secondary = [];
+            entries.forEach(e => {
+                if (!seenPos.has(e.posName)) {
+                    seenPos.add(e.posName);
+                    primary.push(e);
+                } else {
+                    secondary.push(e);
+                }
+            });
+
+            return primary.concat(secondary).slice(0, defCount);
         } catch (e) {
             return [];
         }
     }
 
     /* ============================================================
-     *  單字查詢主邏輯 (與原版功能相同，只是抽成獨立函式)
+     *  中文翻譯 (MyMemory API)
+     *  任何失敗（額度用完、逾時、查無翻譯）都回傳 null，
+     *  呼叫端會顯示「中文翻譯暫時無法取得」而不是報錯
+     * ============================================================ */
+    async function translateToZh(text) {
+        if (!text) return null;
+        try {
+            // MyMemory 單句限制約 500 bytes，保留安全邊界做截斷
+            const safeText = text.length > 480 ? text.slice(0, 480) : text;
+            const params = new URLSearchParams({ q: safeText, langpair: 'en|zh-TW' });
+            const res = await fetchWithTimeout(`https://api.mymemory.translated.net/get?${params.toString()}`, 5000);
+            if (!res.ok) return null;
+
+            const data = await res.json();
+            if (!data || data.responseStatus !== 200) return null;
+
+            const translated = data.responseData && data.responseData.translatedText;
+            if (!translated) return null;
+
+            // 額度用完或無翻譯結果時，常見回應是警告字串或直接原樣回傳英文
+            if (/MYMEMORY WARNING/i.test(translated)) return null;
+            if (translated.trim().toLowerCase() === safeText.trim().toLowerCase()) return null;
+
+            return translated;
+        } catch (e) {
+            return null;
+        }
+    }
+
+    /* ============================================================
+     *  單字查詢主邏輯
      * ============================================================ */
     async function queryWord(rawInput) {
         const userInput = rawInput.toLowerCase().trim();
@@ -316,17 +375,35 @@
             output.push(`<span style='color:var(--error)'>❌ 找不到 '${escapeHtml(userInput)}' 的分級資料</span>`);
         }
 
-        // 邏輯 3: 字典解釋
-        let meanings = await getMeaningFromAPI(finalWord);
-        if (meanings.length > 0) {
-            meanings.forEach(m => output.push(`📖 ${m}`));
-        } else {
-            let rawMeanings = await getMeaningFromAPI(userInput);
-            if (rawMeanings.length > 0) {
-                rawMeanings.forEach(m => output.push(`📖 ${m}`));
-            } else {
-                output.push(`<span style='color:var(--dim)'>   (線上字典查無此單字)</span>`);
+        // 邏輯 3: 字典解釋（依 /dict 設定決定條數，以及是否附中文翻譯）
+        let entries = await getMeaningFromAPI(finalWord, apiSettings.defCount);
+        if (entries.length === 0 && finalWord !== userInput) {
+            entries = await getMeaningFromAPI(userInput, apiSettings.defCount);
+        }
+
+        if (entries.length > 0) {
+            // 中文翻譯平行呼叫，任何一條失敗都不影響其他條的顯示
+            let zhResults = [];
+            if (apiSettings.showZh) {
+                const settled = await Promise.allSettled(entries.map(e => translateToZh(e.definition)));
+                zhResults = settled.map(r => (r.status === 'fulfilled' ? r.value : null));
             }
+
+            entries.forEach((e, i) => {
+                let info = `[${escapeHtml(e.posName)}] ${escapeHtml(e.definition)}`;
+                if (apiSettings.showZh) {
+                    const zh = zhResults[i];
+                    info += zh
+                        ? `<br><span style='color: var(--accent); font-size: 0.9em; margin-left: 20px;'>&nbsp;&nbsp;中: ${escapeHtml(zh)}</span>`
+                        : `<br><span style='color: var(--dim); font-style: italic; font-size: 0.9em; margin-left: 20px;'>&nbsp;&nbsp;(中文翻譯暫時無法取得)</span>`;
+                }
+                if (e.example) {
+                    info += `<br><span style='color: var(--dim); font-style: italic; font-size: 0.9em; margin-left: 20px;'>&nbsp;&nbsp;ex: ${escapeHtml(e.example)}</span>`;
+                }
+                output.push(`📖 ${info}`);
+            });
+        } else {
+            output.push(`<span style='color:var(--dim)'>   (線上字典查無此單字)</span>`);
         }
 
         // 邏輯 4: 模糊搜尋
@@ -391,7 +468,7 @@
         return word;
     }
 
-    // 表內單字 -> 3字元 base62；表外單字 -> _hex_ (用底線包住，底線不會出現在正常 3 字元組合裡，因此可安全混合解析)
+    // 表內單字 -> 3字元 base62；表外單字 -> _hex_ (底線不會出現在正常 3 字元組合裡，可安全混合解析)
     function encodeWordList(words) {
         return words.map(w => {
             const idx = wordIndexMap.get(w);
@@ -476,6 +553,8 @@
             '<b style="color: var(--accent);">📜 可用指令</b>',
             '<span style="color: var(--dim);">/clear, /cls</span> — 清空畫面',
             '<span style="color: var(--dim);">/color [主題]</span> — 切換配色，可用: ' + Object.keys(THEMES).join(', '),
+            '<span style="color: var(--dim);">/dict count [1-5]</span> — 設定字典回傳的定義條數',
+            '<span style="color: var(--dim);">/dict zh [on|off]</span> — 開啟/關閉中文翻譯註解',
             '<span style="color: var(--dim);">/history</span> — 顯示輸入歷史，輸入 !N 重新執行第 N 筆',
             '<span style="color: var(--dim);">/save [單字]</span> — 收藏單字（無參數時收藏最近查詢的單字）',
             '<span style="color: var(--dim);">/list, /ls</span> — 列出收藏清單',
@@ -498,6 +577,43 @@
         }
         applyTheme(name);
         appendOutput(`<span style="color: var(--accent);">✅ 已切換主題: ${name}</span>`);
+    }
+
+    function cmdDict(arg) {
+        const parts = (arg || '').trim().split(/\s+/).filter(Boolean);
+
+        if (parts.length === 0) {
+            appendOutput(`目前字典設定: 定義數量=<span style="color: var(--accent);">${apiSettings.defCount}</span>　中文翻譯=<span style="color: var(--accent);">${apiSettings.showZh ? 'on' : 'off'}</span>`);
+            appendOutput(`<span style="color: var(--dim);">用法: /dict count [1-5]　/dict zh [on|off]</span>`);
+            return;
+        }
+
+        const sub = parts[0].toLowerCase();
+
+        if (sub === 'count') {
+            const n = parseInt(parts[1], 10);
+            if (isNaN(n) || n < 1 || n > 5) {
+                appendOutput(`<span style="color: var(--error);">❌ 用法: /dict count [1-5]</span>`);
+                return;
+            }
+            apiSettings.defCount = n;
+            saveApiSettings();
+            appendOutput(`<span style="color: var(--accent);">✅ 字典定義數量設為 ${n}</span>`);
+        } else if (sub === 'zh') {
+            const v = (parts[1] || '').toLowerCase();
+            if (v !== 'on' && v !== 'off') {
+                appendOutput(`<span style="color: var(--error);">❌ 用法: /dict zh [on|off]</span>`);
+                return;
+            }
+            apiSettings.showZh = (v === 'on');
+            saveApiSettings();
+            appendOutput(`<span style="color: var(--accent);">✅ 中文翻譯已${v === 'on' ? '開啟' : '關閉'}</span>`);
+            if (v === 'on') {
+                appendOutput(`<span style="color: var(--dim);">（翻譯來自 MyMemory 免費 API，額度有限，偶爾翻不出來是正常的）</span>`);
+            }
+        } else {
+            appendOutput(`<span style="color: var(--error);">❌ 未知子指令，用法: /dict count [1-5]　/dict zh [on|off]</span>`);
+        }
     }
 
     function cmdHistory() {
@@ -579,6 +695,7 @@
         '/help': cmdHelp,
         '/h': cmdHelp,
         '/color': cmdColor,
+        '/dict': cmdDict,
         '/history': cmdHistory,
         '/save': cmdSave,
         '/list': cmdList,
